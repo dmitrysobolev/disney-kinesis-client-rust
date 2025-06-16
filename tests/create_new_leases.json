@@ -1,0 +1,194 @@
+[
+    {
+        "comment": "trivial",
+        "strategy": "TRIM_HORIZON",
+        "shards": [],
+        "leases": [],
+        "to_create": []
+    },
+    {
+        "comment": "trivial example of first use, also testing that fields are copied from the shard.",
+        "strategy": "TRIM_HORIZON",
+        "shards": [
+            { "shard_id": "shard-000", "hash_key_range": { "starting_hash_key": "start", "ending_hash_key": "end" } }
+        ],
+        "leases": [],
+        "to_create": [
+            { "lease_key": "shard-000", "checkpoint": { "sequence_number": "TRIM_HORIZON" }, "starting_hash_key": "start", "ending_hash_key": "end" }
+        ]
+    },
+    {
+        "comment": "trivial example of first use with LATEST mode.",
+        "strategy": "LATEST",
+        "shards": [
+            { "shard_id": "shard-000" }
+        ],
+        "leases": [],
+        "to_create": [
+            { "lease_key": "shard-000", "checkpoint": { "sequence_number": "LATEST" } }
+        ]
+    },
+    {
+        "comment": "one lease exists, one to be created.",
+        "strategy": "TRIM_HORIZON",
+        "shards": [
+            { "shard_id": "shard-000" },
+            { "shard_id": "shard-001" }
+        ],
+        "leases": [
+            { "lease_key": "shard-000", "checkpoint": { "sequence_number": "TRIM_HORIZON" } }
+        ],
+        "to_create": [
+            { "lease_key": "shard-001", "checkpoint": { "sequence_number": "TRIM_HORIZON" } }
+        ]
+    },
+    {
+        "comment": "first use with 2 generations, only obtain the orphans (the parents)",
+        "strategy": "TRIM_HORIZON",
+        "shards": [
+            { "shard_id": "shard-000" },
+            { "shard_id": "shard-001" },
+            { "shard_id": "shard-002", "parent_shard_id": "shard-000" },
+            { "shard_id": "shard-003", "parent_shard_id": "shard-001" },
+            { "shard_id": "shard-004", "parent_shard_id": "shard-003" }
+        ],
+        "leases": [],
+        "to_create": [
+            { "lease_key": "shard-000", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-001", "checkpoint": { "sequence_number": "TRIM_HORIZON" } }
+        ]
+    },
+    {
+        "comment": "first use with 3 generations, only obtain the orphans (the grandparents)",
+        "strategy": "TRIM_HORIZON",
+        "shards": [
+            { "shard_id": "shard-000" },
+            { "shard_id": "shard-001" },
+            { "shard_id": "shard-002", "parent_shard_id": "shard-000" },
+            { "shard_id": "shard-003", "parent_shard_id": "shard-001" },
+            { "shard_id": "shard-004", "parent_shard_id": "shard-002", "adjacent_parent_shard_id": "shard-003" }
+        ],
+        "leases": [],
+        "to_create": [
+            { "lease_key": "shard-000", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-001", "checkpoint": { "sequence_number": "TRIM_HORIZON" } }
+        ]
+    },
+    {
+        "comment": "first use with 3 generations, only obtain the orphans (the grandparents) but it's AT_TIMESTAMP",
+        "strategy": { "AT_TIMESTAMP": 10 },
+        "shards": [
+            { "shard_id": "shard-000" },
+            { "shard_id": "shard-001" },
+            { "shard_id": "shard-002", "parent_shard_id": "shard-000" },
+            { "shard_id": "shard-003", "parent_shard_id": "shard-001" },
+            { "shard_id": "shard-004", "parent_shard_id": "shard-002", "adjacent_parent_shard_id": "shard-003" }
+        ],
+        "leases": [],
+        "to_create": [
+            { "lease_key": "shard-000", "checkpoint": { "sequence_number": "AT_TIMESTAMP", "sub_sequence_number": 10 } },
+            { "lease_key": "shard-001", "checkpoint": { "sequence_number": "AT_TIMESTAMP", "sub_sequence_number": 10 } }
+        ]
+    },
+    {
+        "comment": "first use with 3 generations, only create the LATEST (ending ancesctors would also be ok)",
+        "strategy": "LATEST",
+        "shards": [
+            { "shard_id": "shard-000" },
+            { "shard_id": "shard-001" },
+            { "shard_id": "shard-002", "parent_shard_id": "shard-000" },
+            { "shard_id": "shard-003", "parent_shard_id": "shard-001" },
+            { "shard_id": "shard-004", "parent_shard_id": "shard-002", "adjacent_parent_shard_id": "shard-003" }
+        ],
+        "leases": [],
+        "to_create": [
+            { "lease_key": "shard-004", "checkpoint": { "sequence_number": "LATEST" }, "parent_shard_ids": [ "shard-002" , "shard-003" ] }
+        ]
+    },
+    {
+        "comment": "3 generations, LATEST created, the ancestors should not be created",
+        "strategy": "LATEST",
+        "shards": [
+            { "shard_id": "shard-000" },
+            { "shard_id": "shard-001" },
+            { "shard_id": "shard-002", "parent_shard_id": "shard-000" },
+            { "shard_id": "shard-003", "parent_shard_id": "shard-001" },
+            { "shard_id": "shard-004", "parent_shard_id": "shard-002", "adjacent_parent_shard_id": "shard-003" }
+        ],
+        "leases": [
+            { "lease_key": "shard-004", "checkpoint": { "sequence_number": "1" }, "parent_shard_ids": [ "shard-002" , "shard-003" ] }
+        ],
+        "to_create": []
+    },
+    {
+        "comment": "we have closed out the grandparents, consume their children but not the grandkids. Scaling out.",
+        "strategy": "LATEST",
+        "shards": [
+            { "shard_id": "shard-000" },
+            { "shard_id": "shard-001" },
+            { "shard_id": "shard-002", "parent_shard_id": "shard-000" },
+            { "shard_id": "shard-003", "parent_shard_id": "shard-000" },
+            { "shard_id": "shard-004", "parent_shard_id": "shard-001" },
+            { "shard_id": "shard-005", "parent_shard_id": "shard-001" },
+            { "shard_id": "shard-006", "parent_shard_id": "shard-002" },
+            { "shard_id": "shard-007", "parent_shard_id": "shard-002" }
+        ],
+        "leases": [
+            { "lease_key": "shard-000", "checkpoint": { "sequence_number": "SHARD_END" }, "child_shard_ids": [ "shard-002" ] },
+            { "lease_key": "shard-001", "checkpoint": { "sequence_number": "SHARD_END" }, "child_shard_ids": [ "shard-003" ] }
+        ],
+        "to_create": [
+            { "lease_key": "shard-002", "checkpoint": { "sequence_number": "TRIM_HORIZON" }, "parent_shard_ids": [ "shard-000" ] },
+            { "lease_key": "shard-003", "checkpoint": { "sequence_number": "TRIM_HORIZON" }, "parent_shard_ids": [ "shard-000" ] },
+            { "lease_key": "shard-004", "checkpoint": { "sequence_number": "TRIM_HORIZON" }, "parent_shard_ids": [ "shard-001" ] },
+            { "lease_key": "shard-005", "checkpoint": { "sequence_number": "TRIM_HORIZON" }, "parent_shard_ids": [ "shard-001" ] }
+        ]
+    },
+    {
+        "comment": "we have closed out the grandparents, consume their children but not the grandkids. Scaling out. AT_TIMESTAMP",
+        "strategy": { "AT_TIMESTAMP": 10 },
+        "shards": [
+            { "shard_id": "shard-000" },
+            { "shard_id": "shard-001" },
+            { "shard_id": "shard-002", "parent_shard_id": "shard-000" },
+            { "shard_id": "shard-003", "parent_shard_id": "shard-000" },
+            { "shard_id": "shard-004", "parent_shard_id": "shard-001" },
+            { "shard_id": "shard-005", "parent_shard_id": "shard-001" },
+            { "shard_id": "shard-006", "parent_shard_id": "shard-002" },
+            { "shard_id": "shard-007", "parent_shard_id": "shard-002" }
+        ],
+        "leases": [
+            { "lease_key": "shard-000", "checkpoint": { "sequence_number": "SHARD_END" }, "child_shard_ids": [ "shard-002" ] },
+            { "lease_key": "shard-001", "checkpoint": { "sequence_number": "SHARD_END" }, "child_shard_ids": [ "shard-003" ] }
+        ],
+        "to_create": [
+            { "lease_key": "shard-002", "checkpoint": { "sequence_number": "AT_TIMESTAMP", "sub_sequence_number": 10 }, "parent_shard_ids": [ "shard-000" ] },
+            { "lease_key": "shard-003", "checkpoint": { "sequence_number": "AT_TIMESTAMP", "sub_sequence_number": 10 }, "parent_shard_ids": [ "shard-000" ] },
+            { "lease_key": "shard-004", "checkpoint": { "sequence_number": "AT_TIMESTAMP", "sub_sequence_number": 10 }, "parent_shard_ids": [ "shard-001" ] },
+            { "lease_key": "shard-005", "checkpoint": { "sequence_number": "AT_TIMESTAMP", "sub_sequence_number": 10 }, "parent_shard_ids": [ "shard-001" ] }
+        ]
+    },
+    {
+        "comment": "we have closed out the grandparents, consume their children but not the grandkids. Scaling in.",
+        "strategy": "LATEST",
+        "shards": [
+            { "shard_id": "shard-000" },
+            { "shard_id": "shard-001" },
+            { "shard_id": "shard-002" },
+            { "shard_id": "shard-003" },
+            { "shard_id": "shard-004", "parent_shard_id": "shard-000", "adjacent_parent_shard_id": "shard-001" },
+            { "shard_id": "shard-005", "parent_shard_id": "shard-002", "adjacent_parent_shard_id": "shard-003" },
+            { "shard_id": "shard-006", "parent_shard_id": "shard-004", "adjacent_parent_shard_id": "shard-005" }
+        ],
+        "leases": [
+            { "lease_key": "shard-000", "checkpoint": { "sequence_number": "SHARD_END" }, "child_shard_ids": [ "shard-004" ] },
+            { "lease_key": "shard-001", "checkpoint": { "sequence_number": "SHARD_END" }, "child_shard_ids": [ "shard-004" ] },
+            { "lease_key": "shard-002", "checkpoint": { "sequence_number": "SHARD_END" }, "child_shard_ids": [ "shard-005" ] },
+            { "lease_key": "shard-003", "checkpoint": { "sequence_number": "SHARD_END" }, "child_shard_ids": [ "shard-005" ] }
+        ],
+        "to_create": [
+            { "lease_key": "shard-004", "checkpoint": { "sequence_number": "TRIM_HORIZON" }, "parent_shard_ids": [ "shard-000", "shard-001" ] },
+            { "lease_key": "shard-005", "checkpoint": { "sequence_number": "TRIM_HORIZON" }, "parent_shard_ids": [ "shard-002", "shard-003" ] }
+        ]
+    }
+]

@@ -1,0 +1,266 @@
+[
+    {
+        "comment": "trivial empty example to make sure nothing blows up",
+        "leases_to_acquire": 1,
+        "max_leases": 8,
+        "worker": "worker-000",
+        "shards": [],
+        "leases": [],
+        "heartbeats": {},
+        "available": [],
+        "expected": 0,
+        "recently_ended_by_us": []
+    },
+    {
+        "comment": "simple case of taking the only, unowned, lease from the pool",
+        "leases_to_acquire": 1,
+        "max_leases": 8,
+        "worker": "worker-000",
+        "shards": [
+            { "shard_id": "shard-000" }
+        ],
+        "leases": [
+            { "lease_key": "shard-000", "lease_owner":         null, "checkpoint": { "sequence_number": "TRIM_HORIZON" } }
+        ],
+        "heartbeats": {
+        },
+        "available": [ "shard-000" ],
+        "expected": 1,
+        "recently_ended_by_us": []
+    },
+    {
+        "comment": "simple case of not taking any leases from an owned pool",
+        "leases_to_acquire": 1,
+        "max_leases": 8,
+        "worker": "worker-000",
+        "shards": [
+            { "shard_id": "shard-000" }
+        ],
+        "leases": [
+            { "lease_key": "shard-000", "lease_owner": "worker-001", "checkpoint": { "sequence_number": "TRIM_HORIZON" } }
+        ],
+        "heartbeats": {
+            "shard-000": 1
+        },
+        "available": [ ],
+        "expected": 0,
+        "recently_ended_by_us": []
+    },
+    {
+        "comment": "take one of several unowned leases, don't touch the owned ones",
+        "leases_to_acquire": 1,
+        "max_leases": 8,
+        "worker": "worker-000",
+        "shards": [
+            { "shard_id": "shard-000" },
+            { "shard_id": "shard-001" },
+            { "shard_id": "shard-002" },
+            { "shard_id": "shard-003" },
+            { "shard_id": "shard-004" },
+            { "shard_id": "shard-005" },
+            { "shard_id": "shard-006" },
+            { "shard_id": "shard-007" }
+        ],
+        "leases": [
+            { "lease_key": "shard-000", "lease_owner":         null, "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-001", "lease_owner":         null, "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-002", "lease_owner":         null, "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-003", "lease_owner":         null, "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-004", "lease_owner": "worker-001", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-005", "lease_owner": "worker-002", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-006", "lease_owner": "worker-003", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-007", "lease_owner": "worker-004", "checkpoint": { "sequence_number": "TRIM_HORIZON" } }
+        ],
+        "heartbeats": {
+            "shard-004": 1,
+            "shard-005": 1,
+            "shard-006": 1,
+            "shard-007": 1
+        },
+        "available": [ "shard-000", "shard-001", "shard-002", "shard-003" ],
+        "expected": 1,
+        "recently_ended_by_us": []
+    },
+    {
+        "comment": "take all the unowned leases, don't touch the owned ones",
+        "leases_to_acquire": 8,
+        "max_leases": 8,
+        "worker": "worker-000",
+        "shards": [
+            { "shard_id": "shard-000" },
+            { "shard_id": "shard-001" },
+            { "shard_id": "shard-002" },
+            { "shard_id": "shard-003" },
+            { "shard_id": "shard-004" },
+            { "shard_id": "shard-005" },
+            { "shard_id": "shard-006" },
+            { "shard_id": "shard-007" }
+        ],
+        "leases": [
+            { "lease_key": "shard-000", "lease_owner":         null, "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-001", "lease_owner":         null, "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-002", "lease_owner":         null, "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-003", "lease_owner":         null, "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-004", "lease_owner": "worker-001", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-005", "lease_owner": "worker-002", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-006", "lease_owner": "worker-003", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-007", "lease_owner": "worker-004", "checkpoint": { "sequence_number": "TRIM_HORIZON" } }
+        ],
+        "heartbeats": {
+            "shard-004": 1,
+            "shard-005": 1,
+            "shard-006": 1,
+            "shard-007": 1
+        },
+        "available": [ "shard-000", "shard-001", "shard-002", "shard-003" ],
+        "expected": 4,
+        "recently_ended_by_us": []
+    },
+    {
+        "comment": "take the unowned and expired leases",
+        "leases_to_acquire": 8,
+        "max_leases": 8,
+        "worker": "worker-000",
+        "shards": [
+            { "shard_id": "shard-000" },
+            { "shard_id": "shard-001" },
+            { "shard_id": "shard-002" },
+            { "shard_id": "shard-003" },
+            { "shard_id": "shard-004" },
+            { "shard_id": "shard-005" },
+            { "shard_id": "shard-006" },
+            { "shard_id": "shard-007" }
+        ],
+        "leases": [
+            { "lease_key": "shard-000", "lease_owner":         null, "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-001", "lease_owner":         null, "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-002", "lease_owner":         null, "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-003", "lease_owner":         null, "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-004", "lease_owner": "worker-001", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-005", "lease_owner": "worker-002", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-006", "lease_owner": "worker-003", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-007", "lease_owner": "worker-004", "checkpoint": { "sequence_number": "TRIM_HORIZON" } }
+        ],
+        "heartbeats": {
+            "shard-004": 20,
+            "shard-005": 1,
+            "shard-006": 1,
+            "shard-007": 1
+        },
+        "available": [ "shard-000", "shard-001", "shard-002", "shard-003", "shard-004" ],
+        "expected": 5,
+        "recently_ended_by_us": []
+    },
+    {
+        "comment": "take only children of the leases that we recently ended",
+        "leases_to_acquire": 8,
+        "max_leases": 8,
+        "worker": "worker-000",
+        "shards": [
+            { "shard_id": "shard-000" },
+            { "shard_id": "shard-001" },
+            { "shard_id": "shard-002" },
+            { "shard_id": "shard-003", "parent_shard_id": "shard-001", "adjacent_parent_shard_id": "shard-002" },
+            { "shard_id": "shard-004" },
+            { "shard_id": "shard-005" },
+            { "shard_id": "shard-006" },
+            { "shard_id": "shard-007" }
+        ],
+        "leases": [
+            { "lease_key": "shard-000", "lease_owner":         null, "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-001", "lease_owner":         null, "checkpoint": { "sequence_number": "SHARD_END" } },
+            { "lease_key": "shard-002", "lease_owner":         null, "checkpoint": { "sequence_number": "SHARD_END" } },
+            { "lease_key": "shard-003", "lease_owner":         null, "checkpoint": { "sequence_number": "TRIM_HORIZON" }, "parent_shard_ids": [ "shard-001", "shard-002" ] },
+            { "lease_key": "shard-004", "lease_owner": "worker-001", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-005", "lease_owner": "worker-002", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-006", "lease_owner": "worker-003", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-007", "lease_owner": "worker-004", "checkpoint": { "sequence_number": "TRIM_HORIZON" } }
+        ],
+        "heartbeats": {
+            "shard-004": 20,
+            "shard-005": 1,
+            "shard-006": 1,
+            "shard-007": 1
+        },
+        "available": [ "shard-003" ],
+        "expected": 1,
+        "recently_ended_by_us": [ "shard-001", "shard-002" ]
+    },
+    {
+        "comment": "don't steal if there are available leases",
+        "leases_to_acquire": 8,
+        "max_leases": 8,
+        "worker": "worker-000",
+        "shards": [
+            { "shard_id": "shard-000" },
+            { "shard_id": "shard-001" },
+            { "shard_id": "shard-002" },
+            { "shard_id": "shard-003" },
+            { "shard_id": "shard-004" },
+            { "shard_id": "shard-005" },
+            { "shard_id": "shard-006" },
+            { "shard_id": "shard-007" }
+        ],
+        "leases": [
+            { "lease_key": "shard-000", "lease_owner":         null, "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-001", "lease_owner": "worker-001", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-002", "lease_owner": "worker-001", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-003", "lease_owner": "worker-001", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-004", "lease_owner": "worker-002", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-005", "lease_owner": "worker-002", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-006", "lease_owner": "worker-003", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-007", "lease_owner": "worker-004", "checkpoint": { "sequence_number": "TRIM_HORIZON" } }
+        ],
+        "heartbeats": {
+            "shard-001": 20,
+            "shard-002": 1,
+            "shard-003": 1,
+            "shard-004": 1,
+            "shard-005": 1,
+            "shard-006": 1,
+            "shard-007": 1
+        },
+        "available": [ "shard-000", "shard-001" ],
+        "expected": 2,
+        "recently_ended_by_us": []
+    },
+    {
+        "comment": "steal one lease from the rich",
+        "leases_to_acquire": 8,
+        "max_leases": 8,
+        "worker": "worker-000",
+        "shards": [
+            { "shard_id": "shard-000" },
+            { "shard_id": "shard-001" },
+            { "shard_id": "shard-002" },
+            { "shard_id": "shard-003" },
+            { "shard_id": "shard-004" },
+            { "shard_id": "shard-005" },
+            { "shard_id": "shard-006" },
+            { "shard_id": "shard-007" }
+        ],
+        "leases": [
+            { "lease_key": "shard-000", "lease_owner": "worker-000", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-001", "lease_owner": "worker-001", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-002", "lease_owner": "worker-001", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-003", "lease_owner": "worker-001", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-004", "lease_owner": "worker-002", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-005", "lease_owner": "worker-002", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-006", "lease_owner": "worker-003", "checkpoint": { "sequence_number": "TRIM_HORIZON" } },
+            { "lease_key": "shard-007", "lease_owner": "worker-004", "checkpoint": { "sequence_number": "TRIM_HORIZON" } }
+        ],
+        "heartbeats": {
+            "shard-000": 1,
+            "shard-001": 1,
+            "shard-002": 1,
+            "shard-003": 1,
+            "shard-004": 1,
+            "shard-005": 1,
+            "shard-006": 1,
+            "shard-007": 1
+        },
+        "available": [ "shard-001", "shard-002", "shard-003" ],
+        "expected": 1,
+        "recently_ended_by_us": []
+    }
+]
