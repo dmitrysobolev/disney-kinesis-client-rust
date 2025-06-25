@@ -41,7 +41,7 @@ use crate::types::SequenceNumber::{AT_TIMESTAMP, LATEST, TRIM_HORIZON};
 pub(crate) const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) fn update_heartbeats(
-    leases: Vec<Lease>,
+    leases: &Vec<Lease>,
     leases_by_key: &mut HashMap<String, Lease>,
     // when we last (locally and monotonically) seen a heartbeat for a lease key
     lease_heartbeats_by_key: &mut HashMap<String, Instant>,
@@ -54,7 +54,7 @@ pub(crate) fn update_heartbeats(
 
     let nowish = Instant::now();
     leases.into_iter().for_each({
-        |e: Lease| {
+        |e: &Lease| {
             // progress all the leases that have had heartbeats since we last checked
             if leases_by_key
                 .get(&e.lease_key)
@@ -64,7 +64,7 @@ pub(crate) fn update_heartbeats(
                 lease_heartbeats_by_key.insert(e.lease_key.clone(), nowish);
             }
             // update the entry
-            leases_by_key.insert(e.lease_key.clone(), e);
+            leases_by_key.insert(e.lease_key.clone(), e.clone());
 
             // there's a LOT of string cloning going on here. Every leaseKey exists multiple times. If we want
             // to have everything point to the same underlying data we'd need to use something like Arc<String>
@@ -245,7 +245,6 @@ pub(crate) fn calculate_acquire(
     worker_identifier: &String,
     leases_to_acquire: usize,
     max_leases: usize,
-    shards: &HashMap<String, Shard>,
     leases_by_key: &HashMap<String, Lease>,
     lease_heartbeats_by_key: &HashMap<String, Instant>,
     recently_ended_by_us: &Vec<String>,
@@ -262,14 +261,14 @@ pub(crate) fn calculate_acquire(
         .map(|(k, _)| k)
         .collect::<HashSet<_>>();
 
-    let mut leases_by_key = leases_by_key
+    let mut active_leases = leases_by_key
         .iter()
         .filter(|&(k, v)| {
             !v.checkpoint.is_ended()
-                && shards.contains_key(k)
-                && v.parent_shard_ids(shards)
+                && leases_by_key.contains_key(k)
+                && v.parent_shard_ids(leases_by_key)
                     .into_iter()
-                    .filter(|&p| shards.contains_key(p))
+                    .filter(|&p| leases_by_key.contains_key(p))
                     .all(|p| ended.contains(p))
         })
         .collect::<HashMap<_, _>>();
@@ -278,16 +277,16 @@ pub(crate) fn calculate_acquire(
         // if we recently ended leases, let's just focus on continuing their
         // legacy; other leases can be picked up on the next cycle.
         let parents = recently_ended_by_us.into_iter().collect::<HashSet<_>>();
-        let preference = leases_by_key
+        let preference = active_leases
             .iter()
-            .filter(|(_, &v)| v.lease_owner.is_none() && v.is_child_of(&parents, shards))
+            .filter(|(_, &v)| v.lease_owner.is_none() && v.is_child_of(&parents, leases_by_key))
             .map(|(&k, &v)| (k, v))
             .collect::<HashMap<_, _>>();
 
         if !preference.is_empty() {
             // disables regular lease taking in this pass, as we focus on
             // obtaining the children of closed leases.
-            leases_by_key = preference;
+            active_leases = preference;
         }
     }
 
@@ -301,7 +300,7 @@ pub(crate) fn calculate_acquire(
     // note that we use the source of truth about how many leases we hold, not a
     // locally cached count of workers. This must only count active leases,
     // since it is used to find "rich" workers.
-    let shares = leases_by_key
+    let shares = active_leases
         .iter()
         .filter(|(_, v)| !expired.contains(&v.lease_key))
         .flat_map(|(_, v)| v.lease_owner.clone())
@@ -314,7 +313,7 @@ pub(crate) fn calculate_acquire(
 
     // we could add weights here if we had a preference.
     // we allow picking our own expired leases.
-    let to_acquire = leases_by_key
+    let to_acquire = active_leases
         .iter()
         .filter(|(&key, &lease)| lease.lease_owner.is_none() || expired.contains(key))
         .map(|(_, &v)| v)
@@ -336,7 +335,7 @@ pub(crate) fn calculate_acquire(
     // Be careful about changing this code as it is easy to come up with a lease
     // stealing algorithm that thrashes around the optimal distribution; we want
     // to minimise lost leases.
-    if headroom > 0 && !leases_by_key.is_empty() {
+    if headroom > 0 && !active_leases.is_empty() {
         let correction = if ours == 0 { 1 } else { 0 };
         let avg = shares.values().sum::<usize>() / (shares.len() + correction);
         if ours <= avg {
@@ -361,7 +360,7 @@ pub(crate) fn calculate_acquire(
             // perhaps be improved by choosing based on kbps to trend towards
             // the fleet average. Recall that it is only stable to steal 1
             // lease.
-            if let Some(&target) = leases_by_key
+            if let Some(&target) = active_leases
                 .into_values()
                 .filter(|lease| match &lease.lease_owner {
                     Some(owner) => rich.contains(owner),
@@ -415,7 +414,6 @@ mod tests {
         leases_to_acquire: usize,
         max_leases: usize,
         worker: String,
-        shards: Vec<dupes::Shard>,
         leases: Vec<Lease>,
         heartbeats: HashMap<String, u64>, // shard_id -> age in seconds
         available: Vec<String>,           // shard_ids
@@ -471,7 +469,6 @@ mod tests {
     fn test_calculate_acquire() {
         for test in read_scenarios::<Acquire>("tests/calculate_acquire.json") {
             let leases = leases(test.leases);
-            let shards = shards(test.shards);
 
             let heartbeats: HashMap<_, _> = test
                 .heartbeats
@@ -488,7 +485,6 @@ mod tests {
                 &test.worker,
                 test.leases_to_acquire,
                 test.max_leases,
-                &shards,
                 &leases,
                 &heartbeats,
                 &test.recently_ended_by_us,
