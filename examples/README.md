@@ -452,15 +452,14 @@ clap = { version = "4.0", features = ["derive"] }
 
 ## Next Steps
 
-1. **Read the detailed usage guide**: See `USAGE.md` for comprehensive documentation
-2. **Start with the basic consumer**: Get familiar with the core concepts
-3. **Experiment with configurations**: Try different settings to understand their impact
-4. **Scale up**: Test with multiple workers and higher throughput
-5. **Add monitoring**: Implement custom metrics for your use case
-6. **Deploy to production**: Use the patterns from the advanced example
+1. **Start with the basic consumer**: Get familiar with the core concepts
+2. **Experiment with configurations**: Try different settings to understand their impact
+3. **Scale up**: Test with multiple workers and higher throughput
+4. **Add monitoring**: Implement custom metrics for your use case
+5. **Deploy to production**: Use the patterns from the advanced example
 
 ## Support
 
-- **Source code**: [GitHub Repository](https://github.com/disneystreaming/disney-kinesis-client-rust)
+- **Source code**: [GitHub Repository](https://github.com/disney/disney-kinesis-client-rust)
 - **AWS Kinesis docs**: [Amazon Kinesis Documentation](https://docs.aws.amazon.com/kinesis/)
 - **Java KCL reference**: [Kinesis Client Library Documentation](https://docs.aws.amazon.com/streams/latest/dev/shared-throughput-kcl-consumers.html)
