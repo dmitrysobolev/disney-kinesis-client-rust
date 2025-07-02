@@ -36,7 +36,7 @@ pub async fn init() -> (
     // tracing_subscriber::fmt().json().init();
     tracing_subscriber::fmt().init();
 
-    let config = aws_config::load_defaults(aws_config::BehaviorVersion::v2024_03_28()).await;
+    let config = aws_config::load_defaults(aws_config::BehaviorVersion::v2025_01_17()).await;
 
     let cw = aws_sdk_cloudwatch::Client::new(&config);
     let ddb = aws_sdk_dynamodb::Client::new(&config);

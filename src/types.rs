@@ -54,10 +54,13 @@ pub(crate) struct Lease {
     /// the new worker will pick up after the old worker's last checkpoint.
     pub checkpoint: ExtendedSequenceNumber,
 
-    // the following are unused but written to be compatible with the Java KCL.
-    // prefer the source of truth (the shards).
+    /// A copy of the shard's parent id, so that non-leader nodes (who may
+    /// have a stale view of ListShards) can build the full dependency graph.
     #[serde(default)]
     parent_shard_ids: Vec<String>,
+
+    // the following are unused but written to be compatible with the Java KCL.
+    // prefer the source of truth (the shards).
     #[serde(default)]
     owner_switches_since_checkpoint: i64,
     #[serde(default)]
@@ -247,24 +250,22 @@ impl Lease {
         }
     }
 
-    /// using the source of truth, is this a direct child of the given shard_ids?
+    /// is this a direct child of the given shard_ids?
     pub fn is_child_of(
         &self,
         candidates: &HashSet<&String>,
-        shards: &HashMap<String, Shard>,
+        leases: &HashMap<String, Lease>,
     ) -> bool {
         return self
-            .parent_shard_ids(shards)
+            .parent_shard_ids(leases)
             .iter()
             .any(|p| candidates.contains(p));
     }
 
-    /// uses the source of truth (the shards) rather than the field of the same
-    /// name. may disagree based on the implementation that created the lease.
-    pub fn parent_shard_ids<'a>(&self, shards: &'a HashMap<String, Shard>) -> Vec<&'a String> {
-        shards
+    pub fn parent_shard_ids<'a>(&self, leases: &'a HashMap<String, Lease>) -> Vec<&'a String> {
+        leases
             .get(&self.lease_key)
-            .map(|s| shard_parent_ids(s))
+            .map(|s| s.parent_shard_ids.iter().collect())
             .unwrap_or_default()
     }
 }

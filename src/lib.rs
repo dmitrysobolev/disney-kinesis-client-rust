@@ -38,6 +38,7 @@ use aws_sdk_dynamodb::types::{AttributeValue, BillingMode};
 use aws_sdk_kinesis::types::Shard;
 use aws_smithy_types::DateTime;
 use oversee::HEARTBEAT_TIMEOUT;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -362,7 +363,6 @@ impl Client {
         let mut leases_by_key = HashMap::new();
         let mut lease_heartbeats_by_key = HashMap::new();
         let mut ended = Vec::new();
-        let mut shards = HashMap::new();
 
         loop {
             if self.shutdown.is_cancelled() {
@@ -377,12 +377,7 @@ impl Client {
 
             let loop_start = Instant::now();
             let _ = self
-                .oversee(
-                    &mut shards,
-                    &mut leases_by_key,
-                    &mut lease_heartbeats_by_key,
-                    &ended,
-                )
+                .oversee(&mut leases_by_key, &mut lease_heartbeats_by_key, &ended)
                 .await?;
             ended.clear();
 
@@ -402,14 +397,13 @@ impl Client {
         }
     }
 
-    // an overseer process checks the full set of shards and leases
-    // regularly (with backoff) and decides if we need to acquire another.
-    // Leases are grabbed randomly up to a limit, with a delay between each.
-    // Once all leases have been assigned to a worker, we can steal a lease
-    // from any worker with more than some percentage threshold of our
-    // workload (preferring the workers with the most leases). We must be
-    // careful not to spawn new processes on split or merged shards unless
-    // their parents are fully consumed.
+    // an overseer process checks the full set of shards and leases and decides
+    // if we need to acquire another. Leases are grabbed randomly up to a limit,
+    // with a delay between each. Once all leases have been assigned to a
+    // worker, we can steal a lease from any worker with more than some
+    // percentage threshold of our workload (preferring the workers with the
+    // most leases). We must be careful not to spawn new processes on split or
+    // merged shards unless their parents are fully consumed.
     //
     // Each lease that we own should run in a loop polling from kinesis,
     // writing heartbeats and writing checkpoints, terminating if we have
@@ -426,7 +420,6 @@ impl Client {
     // time, e.g. by acting on a user signal.
     async fn oversee(
         &self,
-        shards: &mut HashMap<String, Shard>,
         // the last time we seen each lease
         leases_by_key: &mut HashMap<String, Lease>,
         // when we last (locally and monotonically) seen a heartbeat for a lease key
@@ -445,44 +438,73 @@ impl Client {
         // fresh view of the shards then we can only update the heartbeats and
         // try to acquire new leases, we cannot safely mutate the lease table.
         let leases = list_leases(&self.ddb_client, &self.table_name).await?;
-        *shards = list_shards(&self.kinesis_client, &self.stream_name)
-            .await?
-            .into_iter()
-            .map(|s| (s.shard_id.clone(), s))
-            .collect();
-        assert!(!shards.is_empty()); // should always be at least 1
+        oversee::update_heartbeats(&leases, leases_by_key, lease_heartbeats_by_key);
 
-        self.publish_metrics(&leases, &shards).await?;
+        // In KCL the leader is elected through a shared concept by looking at
+        // the randomly assigned IDs, but it's fragile because it takes some
+        // time to notice when the leader is not making progress. Our approach
+        // is for every node to decide randomly if they should be the leader in
+        // this turn. If they are the leader then they can create and delete
+        // leases, if they are not the leader then they should not mutate the
+        // lease table in any way.
+        //
+        // Every turn we have a 2 in N chance of being the leader, where N is
+        // the number of active workers. There's no point in rolling the dice if
+        // we have less than 2 workers. Probably we could lift the floor here
+        // but it complicates the testing strategy. When we recently ended any
+        // shards then we'll definitely want to opt to become the leader because
+        // we need to create the children.
+        //
+        // For maximum compatibility running alongside Java SDK clients we could
+        // assume leadership when we would have been the elected leader, but
+        // it's not strictly necessary.
+        let nowish = Instant::now();
+        let workers = lease_heartbeats_by_key
+            .iter()
+            .filter(|(_, ts)| nowish.duration_since(**ts) <= HEARTBEAT_TIMEOUT)
+            .count();
+        if !recently_ended.is_empty()
+            || workers < 2
+            || rand::thread_rng().gen_range(0..(workers / 2)) == 0
+        {
+            // we're a leader in this cycle...
+            let shards: HashMap<String, Shard> =
+                list_shards(&self.kinesis_client, &self.stream_name)
+                    .await?
+                    .into_iter()
+                    .map(|s| (s.shard_id.clone(), s))
+                    .collect();
+            assert!(!shards.is_empty()); // should always be at least 1
+            self.publish_metrics(&leases, shards.len()).await?;
 
-        // update our local timestamps of lease updates (heartbeats)
-        oversee::update_heartbeats(leases, leases_by_key, lease_heartbeats_by_key);
+            // see if we need to create any new leases, noting that they won't be
+            // visible to us yet, to keep things simpler (consistency is king).
+            let new_leases = oversee::calculate_new_leases(
+                &self.management_config.start_strategy,
+                &shards,
+                leases_by_key,
+            );
+            oversee::create_new_leases(&self.ddb_client, &self.table_name, &new_leases).await?;
 
-        // see if we need to create any new leases, noting that they won't be
-        // visible to us yet, to keep things simpler (consistency is king).
-        let new_leases = oversee::calculate_new_leases(
-            &self.management_config.start_strategy,
-            &shards,
-            leases_by_key,
-        );
-        oversee::create_new_leases(&self.ddb_client, &self.table_name, &new_leases).await?;
+            // mutate the leases map so that we can immediately acquire them. even
+            // if we failed to write them, somebody else will have created them.
+            new_leases.into_iter().for_each(|e| {
+                leases_by_key.insert(e.lease_key.clone(), e);
+            });
 
-        // mutate the leases map so that we can immediately acquire them. even
-        // if we failed to write them, somebody else will have created them.
-        new_leases.into_iter().for_each(|e| {
-            leases_by_key.insert(e.lease_key.clone(), e);
-        });
-
-        // delete leases for shards that no longer exist, if we have an up to date snapshot
-        // of the shards.
-        oversee::delete_redundant(&self.ddb_client, &self.table_name, &shards, leases_by_key)
-            .await?;
+            // delete leases for shards that no longer exist, if we have an up to date snapshot
+            // of the shards.
+            oversee::delete_redundant(&self.ddb_client, &self.table_name, &shards, leases_by_key)
+                .await?;
+        } else {
+            self.publish_metrics(&leases, 0).await?;
+        }
 
         // populate the leases that we should try to acquire
         let to_acquire: Vec<Lease> = oversee::calculate_acquire(
             &self.worker_identifier,
             self.management_config.leases_to_acquire,
             self.management_config.max_leases,
-            &shards,
             leases_by_key,
             lease_heartbeats_by_key,
             recently_ended,
@@ -568,12 +590,7 @@ impl Client {
         return Ok(());
     }
 
-    async fn publish_metrics(
-        &self,
-        leases: &Vec<Lease>,
-        shards: &HashMap<String, Shard>,
-    ) -> Result<(), Fail> {
-        let total_shards = shards.len();
+    async fn publish_metrics(&self, leases: &Vec<Lease>, total_shards: usize) -> Result<(), Fail> {
         let total_leases = leases.len();
         let unclaimed_leases = leases.iter().filter(|e| e.lease_owner.is_none()).count();
         let us = Some(self.worker_identifier.clone());
@@ -591,11 +608,6 @@ impl Client {
 
         let nowish = DateTime::from(SystemTime::now());
 
-        let total_shards = MetricDatum::builder()
-            .metric_name("total_shards")
-            .value(total_shards as f64)
-            .timestamp(nowish.clone())
-            .build();
         let total_leases = MetricDatum::builder()
             .metric_name("total_leases")
             .value(total_leases as f64)
@@ -612,15 +624,24 @@ impl Client {
             .timestamp(nowish.clone())
             .build();
 
-        self.cw_client
+        let mut req = self
+            .cw_client
             .put_metric_data()
             .namespace(&self.table_name)
-            .metric_data(total_shards)
             .metric_data(total_leases)
             .metric_data(unclaimed_leases)
-            .metric_data(worker_leases)
-            .send()
-            .await?;
+            .metric_data(worker_leases);
+
+        if total_shards > 0 {
+            let total_shards = MetricDatum::builder()
+                .metric_name("total_shards")
+                .value(total_shards as f64)
+                .timestamp(nowish.clone())
+                .build();
+            req = req.metric_data(total_shards);
+        }
+
+        req.send().await?;
 
         Ok(())
     }
