@@ -1,159 +1,384 @@
-// Copyright 2024-2025 Sam Halliday, Rob Pickerill (The Walt Disney Company)
-//
-// Licensed under the Tomorrow Open Source Technology License, Version 1.0 (the
-// "License"); you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//  https://disneystreaming.github.io/TOST-1.0.txt
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// License for the specific language governing permissions and limitations under
-// the License.
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-//! Multi-worker example demonstrating distributed consumption.
-//!
-//! This example shows how to run multiple consumer workers in parallel,
-//! demonstrating the distributed lease management capabilities of the library.
-//! Each worker will compete for leases and process different shards.
-//!
-//! Usage:
-//!   cargo run --example multi_worker -- --stream-name YOUR_STREAM_NAME --table-name YOUR_TABLE_NAME --workers 3
-
-use std::{sync::Arc, time::Duration, collections::HashMap};
 use async_trait::async_trait;
+use aws_config::BehaviorVersion;
 use clap::Parser;
-use disney_kinesis_client::*;
-use tokio::{sync::RwLock, time::sleep};
-use tracing::{info, warn, error};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{RwLock, mpsc};
+use tokio::time::{sleep, interval};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
-#[derive(Parser)]
-#[command(name = "multi_worker")]
-#[command(about = "Multi-worker Kinesis consumer example")]
+use disney_kinesis_client::{
+    checkpointer::Checkpointer,
+    client::KinesisClient,
+    config::{KinesisClientConfig, LeaseConfig, ManagementConfig},
+    factory::KinesisClientFactory,
+    processor::{KinesisClientRecord, ShardRecordProcessor},
+    types::StartStrategy,
+};
+
+#[derive(Parser, Debug)]
+#[clap(author, version, about, long_about = None)]
 struct Args {
-    #[arg(short, long)]
+    /// Kinesis stream name
+    #[clap(long)]
     stream_name: String,
-    
-    #[arg(short, long)]
+
+    /// DynamoDB table name for lease management
+    #[clap(long)]
     table_name: String,
-    
-    #[arg(short, long, default_value = "3")]
+
+    /// Number of worker instances to run
+    #[clap(long, default_value = "3")]
     workers: usize,
-    
-    #[arg(long, default_value = "60")]
+
+    /// Duration to run in seconds (0 for unlimited)
+    #[clap(long, default_value = "120")]
     run_duration_seconds: u64,
+
+    /// Application name for metrics and grouping
+    #[clap(long, default_value = "multi-worker-demo")]
+    app_name: String,
+
+    /// Batch size for record processing
+    #[clap(long, default_value = "500")]
+    batch_size: usize,
+
+    /// Leases to acquire per worker
+    #[clap(long, default_value = "2")]
+    leases_to_acquire: usize,
+
+    /// Maximum leases per worker
+    #[clap(long, default_value = "10")]
+    max_leases: usize,
+
+    /// Statistics reporting interval in seconds
+    #[clap(long, default_value = "15")]
+    stats_interval_seconds: u64,
+
+    /// Enable worker restart on failure
+    #[clap(long)]
+    auto_restart: bool,
+
+    /// Worker failure restart delay in seconds
+    #[clap(long, default_value = "30")]
+    restart_delay_seconds: u64,
+
+    /// Enable dynamic scaling (add/remove workers)
+    #[clap(long)]
+    dynamic_scaling: bool,
+
+    /// Target records per second per worker for scaling
+    #[clap(long, default_value = "100")]
+    target_rps_per_worker: f64,
 }
 
-/// Shared statistics across all workers
-#[derive(Debug, Default, Clone)]
-struct GlobalStats {
-    total_records_processed: u64,
-    total_bytes_processed: u64,
-    active_shards: HashMap<String, String>, // shard_id -> worker_id
-    worker_stats: HashMap<String, WorkerStats>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkerMessage {
+    worker_id: String,
+    message_type: String,
+    payload: serde_json::Value,
+    timestamp: u64,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 struct WorkerStats {
-    records_processed: u64,
-    bytes_processed: u64,
-    active_shards: Vec<String>,
-    start_time: Option<std::time::Instant>,
-}
-
-/// A processor that tracks statistics and coordinates with other workers
-struct MultiWorkerProcessor {
-    checkpointer: Checkpointer,
     worker_id: String,
-    global_stats: Arc<RwLock<GlobalStats>>,
-    local_stats: Arc<RwLock<WorkerStats>>,
+    records_processed: AtomicU64,
+    bytes_processed: AtomicU64,
+    processing_errors: AtomicU64,
+    active_shards: RwLock<Vec<String>>,
+    start_time: Instant,
+    last_activity: RwLock<Instant>,
+    current_rps: RwLock<f64>,
+    status: RwLock<WorkerStatus>,
 }
 
-/// Factory that creates processors and manages global coordination
-struct MultiWorkerProcessorFactory {
-    worker_id: String,
-    global_stats: Arc<RwLock<GlobalStats>>,
+#[derive(Debug, Clone, PartialEq)]
+enum WorkerStatus {
+    Starting,
+    Running,
+    Stopping,
+    Failed,
+    Restarting,
 }
 
-impl MultiWorkerProcessorFactory {
+impl WorkerStats {
     fn new(worker_id: String) -> Self {
-        Self {
-            worker_id: worker_id.clone(),
-            global_stats: Arc::new(RwLock::new(GlobalStats::default())),
-        }
-    }
-    
-    fn clone_with_shared_stats(&self, worker_id: String) -> Self {
+        let now = Instant::now();
         Self {
             worker_id,
-            global_stats: self.global_stats.clone(),
+            records_processed: AtomicU64::new(0),
+            bytes_processed: AtomicU64::new(0),
+            processing_errors: AtomicU64::new(0),
+            active_shards: RwLock::new(Vec::new()),
+            start_time: now,
+            last_activity: RwLock::new(now),
+            current_rps: RwLock::new(0.0),
+            status: RwLock::new(WorkerStatus::Starting),
         }
     }
 
-    async fn print_global_stats(&self) {
-        let stats = self.global_stats.read().await;
-        
-        info!("=== Global Statistics ===");
-        info!("Total records processed: {}", stats.total_records_processed);
-        info!("Total bytes processed: {}", stats.total_bytes_processed);
-        info!("Active shards: {}", stats.active_shards.len());
-        
-        for (shard_id, worker_id) in &stats.active_shards {
-            info!("  Shard {} -> Worker {}", shard_id, worker_id);
+    async fn update_activity(&self) {
+        let mut last_activity = self.last_activity.write().await;
+        *last_activity = Instant::now();
+    }
+
+    async fn calculate_rps(&self) -> f64 {
+        let records = self.records_processed.load(Ordering::Relaxed);
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        if elapsed > 0.0 {
+            records as f64 / elapsed
+        } else {
+            0.0
         }
+    }
+
+    async fn update_rps(&self) {
+        let rps = self.calculate_rps().await;
+        let mut current_rps = self.current_rps.write().await;
+        *current_rps = rps;
+    }
+
+    async fn is_healthy(&self) -> bool {
+        let last_activity = self.last_activity.read().await;
+        let status = self.status.read().await;
         
-        info!("Worker Statistics:");
-        for (worker_id, worker_stats) in &stats.worker_stats {
-            let duration = worker_stats.start_time
-                .map(|t| t.elapsed().as_secs())
-                .unwrap_or(0);
-            
-            info!(
-                "  Worker {}: {} records, {} bytes, {} shards, running for {}s",
-                worker_id,
-                worker_stats.records_processed,
-                worker_stats.bytes_processed,
-                worker_stats.active_shards.len(),
-                duration
-            );
+        match *status {
+            WorkerStatus::Failed => false,
+            WorkerStatus::Stopping => false,
+            _ => last_activity.elapsed() < Duration::from_secs(120), // 2 minutes
         }
-        info!("========================");
     }
 }
 
-#[async_trait]
-impl ShardRecordProcessorFactory for MultiWorkerProcessorFactory {
-    async fn initialize(&self, checkpointer: Checkpointer) -> Box<dyn ShardRecordProcessor> {
-        let shard_id = checkpointer.lease_key.clone();
-        let worker_id = self.worker_id.clone();
-        
-        info!("Worker {} acquired shard: {}", worker_id, shard_id);
-        
-        // Update global statistics
-        {
-            let mut stats = self.global_stats.write().await;
-            stats.active_shards.insert(shard_id.clone(), worker_id.clone());
-            
-            let worker_stats = stats.worker_stats.entry(worker_id.clone()).or_default();
-            worker_stats.active_shards.push(shard_id.clone());
-            if worker_stats.start_time.is_none() {
-                worker_stats.start_time = Some(std::time::Instant::now());
+#[derive(Debug)]
+struct GlobalCoordinator {
+    workers: RwLock<HashMap<String, Arc<WorkerStats>>>,
+    total_records: AtomicU64,
+    total_bytes: AtomicU64,
+    total_errors: AtomicU64,
+    active_shards: RwLock<HashMap<String, String>>, // shard_id -> worker_id
+    start_time: Instant,
+    target_rps_per_worker: f64,
+}
+
+impl GlobalCoordinator {
+    fn new(target_rps_per_worker: f64) -> Self {
+        Self {
+            workers: RwLock::new(HashMap::new()),
+            total_records: AtomicU64::new(0),
+            total_bytes: AtomicU64::new(0),
+            total_errors: AtomicU64::new(0),
+            active_shards: RwLock::new(HashMap::new()),
+            start_time: Instant::now(),
+            target_rps_per_worker,
+        }
+    }
+
+    async fn register_worker(&self, worker_stats: Arc<WorkerStats>) {
+        let worker_id = worker_stats.worker_id.clone();
+        let mut workers = self.workers.write().await;
+        workers.insert(worker_id.clone(), worker_stats);
+        info!("Registered worker: {}", worker_id);
+    }
+
+    async fn unregister_worker(&self, worker_id: &str) {
+        let mut workers = self.workers.write().await;
+        workers.remove(worker_id);
+        info!("Unregistered worker: {}", worker_id);
+    }
+
+    async fn update_shard_assignment(&self, shard_id: String, worker_id: String) {
+        let mut shards = self.active_shards.write().await;
+        shards.insert(shard_id, worker_id);
+    }
+
+    async fn remove_shard_assignment(&self, shard_id: &str) {
+        let mut shards = self.active_shards.write().await;
+        shards.remove(shard_id);
+    }
+
+    async fn get_worker_count(&self) -> usize {
+        let workers = self.workers.read().await;
+        workers.len()
+    }
+
+    async fn get_healthy_worker_count(&self) -> usize {
+        let workers = self.workers.read().await;
+        let mut healthy_count = 0;
+        for worker in workers.values() {
+            if worker.is_healthy().await {
+                healthy_count += 1;
             }
         }
-        
-        let local_stats = Arc::new(RwLock::new(WorkerStats {
-            start_time: Some(std::time::Instant::now()),
-            ..Default::default()
-        }));
+        healthy_count
+    }
 
-        Box::new(MultiWorkerProcessor {
-            checkpointer,
+    async fn should_scale_up(&self) -> bool {
+        let workers = self.workers.read().await;
+        let mut total_rps = 0.0;
+        let mut active_workers = 0;
+
+        for worker in workers.values() {
+            if worker.is_healthy().await {
+                total_rps += worker.calculate_rps().await;
+                active_workers += 1;
+            }
+        }
+
+        if active_workers == 0 {
+            return false;
+        }
+
+        let avg_rps = total_rps / active_workers as f64;
+        avg_rps > self.target_rps_per_worker * 1.5 // Scale up if 50% above target
+    }
+
+    async fn should_scale_down(&self) -> bool {
+        let workers = self.workers.read().await;
+        let mut total_rps = 0.0;
+        let mut active_workers = 0;
+
+        for worker in workers.values() {
+            if worker.is_healthy().await {
+                total_rps += worker.calculate_rps().await;
+                active_workers += 1;
+            }
+        }
+
+        if active_workers <= 1 {
+            return false; // Never scale down below 1 worker
+        }
+
+        let avg_rps = total_rps / active_workers as f64;
+        avg_rps < self.target_rps_per_worker * 0.5 // Scale down if 50% below target
+    }
+
+    async fn print_statistics(&self) {
+        let workers = self.workers.read().await;
+        let shards = self.active_shards.read().await;
+        
+        let total_records = self.total_records.load(Ordering::Relaxed);
+        let total_bytes = self.total_bytes.load(Ordering::Relaxed);
+        let total_errors = self.total_errors.load(Ordering::Relaxed);
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        
+        let overall_rps = if elapsed > 0.0 {
+            total_records as f64 / elapsed
+        } else {
+            0.0
+        };
+
+        info!("=== Multi-Worker Statistics ===");
+        info!("Runtime: {:.1}s", elapsed);
+        info!("Total Records: {}", total_records);
+        info!("Total Bytes: {}", total_bytes);
+        info!("Total Errors: {}", total_errors);
+        info!("Overall RPS: {:.2}", overall_rps);
+        info!("Active Workers: {}", workers.len());
+        info!("Active Shards: {}", shards.len());
+
+        let mut healthy_workers = 0;
+        let mut total_worker_rps = 0.0;
+
+        info!("Worker Details:");
+        for (worker_id, worker_stats) in workers.iter() {
+            let records = worker_stats.records_processed.load(Ordering::Relaxed);
+            let bytes = worker_stats.bytes_processed.load(Ordering::Relaxed);
+            let errors = worker_stats.processing_errors.load(Ordering::Relaxed);
+            let worker_rps = worker_stats.calculate_rps().await;
+            let worker_elapsed = worker_stats.start_time.elapsed().as_secs_f64();
+            let status = worker_stats.status.read().await;
+            let active_shards = worker_stats.active_shards.read().await;
+            let is_healthy = worker_stats.is_healthy().await;
+
+            if is_healthy {
+                healthy_workers += 1;
+                total_worker_rps += worker_rps;
+            }
+
+            info!(
+                "  {}: {} records ({:.2} RPS), {} bytes, {} errors, {} shards, {:.1}s, {:?}, {}",
+                worker_id,
+                records,
+                worker_rps,
+                bytes,
+                errors,
+                active_shards.len(),
+                worker_elapsed,
+                *status,
+                if is_healthy { "HEALTHY" } else { "UNHEALTHY" }
+            );
+
+            for shard_id in active_shards.iter() {
+                info!("    Shard: {}", shard_id);
+            }
+        }
+
+        if healthy_workers > 0 {
+            let avg_rps = total_worker_rps / healthy_workers as f64;
+            info!("Average RPS per healthy worker: {:.2}", avg_rps);
+        }
+
+        info!("Shard Distribution:");
+        for (shard_id, worker_id) in shards.iter() {
+            info!("  {} -> {}", shard_id, worker_id);
+        }
+
+        info!("===============================");
+    }
+}
+
+struct MultiWorkerProcessor {
+    worker_id: String,
+    coordinator: Arc<GlobalCoordinator>,
+    worker_stats: Arc<WorkerStats>,
+}
+
+impl MultiWorkerProcessor {
+    fn new(worker_id: String, coordinator: Arc<GlobalCoordinator>) -> Self {
+        let worker_stats = Arc::new(WorkerStats::new(worker_id.clone()));
+        Self {
             worker_id,
-            global_stats: self.global_stats.clone(),
-            local_stats,
-        })
+            coordinator,
+            worker_stats,
+        }
+    }
+
+    async fn process_message(&self, message: &WorkerMessage) -> Result<(), String> {
+        // Simulate different processing patterns based on message type
+        match message.message_type.as_str() {
+            "user_action" => {
+                info!("Worker {} processing user action: {}", self.worker_id, message.worker_id);
+                // Simulate user action processing
+                sleep(Duration::from_millis(50)).await;
+                Ok(())
+            }
+            "system_event" => {
+                info!("Worker {} processing system event: {}", self.worker_id, message.worker_id);
+                // Simulate system event processing
+                sleep(Duration::from_millis(100)).await;
+                Ok(())
+            }
+            "error_event" => {
+                warn!("Worker {} processing error event: {}", self.worker_id, message.worker_id);
+                // Simulate error processing (might fail)
+                if message.worker_id.ends_with("err") {
+                    return Err("Simulated processing error".to_string());
+                }
+                sleep(Duration::from_millis(200)).await;
+                Ok(())
+            }
+            _ => {
+                info!("Worker {} processing unknown message type: {}", self.worker_id, message.message_type);
+                Ok(())
+            }
+        }
     }
 }
 
@@ -161,252 +386,330 @@ impl ShardRecordProcessorFactory for MultiWorkerProcessorFactory {
 impl ShardRecordProcessor for MultiWorkerProcessor {
     async fn process_records(&self, records: Vec<KinesisClientRecord>, millis_behind_latest: i64) {
         let count = records.len();
-        let shard_id = &self.checkpointer.lease_key;
-        
         info!(
-            "Worker {} processing {} records for shard {} ({}ms behind)",
-            self.worker_id, count, shard_id, millis_behind_latest
+            "Worker {} processing {} records ({}ms behind latest)",
+            self.worker_id, count, millis_behind_latest
         );
 
+        let mut processed_count = 0;
+        let mut failed_count = 0;
         let mut total_bytes = 0;
-        
-        // Simulate processing with some variety in processing time
+
         for (i, record) in records.iter().enumerate() {
-            total_bytes += record.record.data.as_ref().len();
-            
-            // Simulate different processing patterns
-            if i % 10 == 0 {
-                // Occasionally simulate slower processing
-                sleep(Duration::from_millis(10)).await;
-            }
-            
-            // Log some records for visibility
-            if i < 3 || i == records.len() - 1 {
-                let data_preview = String::from_utf8_lossy(record.record.data.as_ref());
-                info!(
-                    "Worker {} [{}]: Record {} - {}",
-                    self.worker_id,
-                    shard_id,
-                    i,
-                    data_preview.chars().take(50).collect::<String>()
-                );
+            total_bytes += record.record.data.len();
+
+            // Try to parse as JSON message first
+            match serde_json::from_slice::<WorkerMessage>(record.record.data.as_ref()) {
+                Ok(message) => {
+                    match self.process_message(&message).await {
+                        Ok(_) => processed_count += 1,
+                        Err(e) => {
+                            failed_count += 1;
+                            error!("Worker {} failed to process message: {}", self.worker_id, e);
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Fall back to processing as raw data
+                    let data_preview = String::from_utf8_lossy(record.record.data.as_ref());
+                    info!(
+                        "Worker {} processing raw data [{}]: {}",
+                        self.worker_id,
+                        i,
+                        data_preview.chars().take(50).collect::<String>()
+                    );
+                    processed_count += 1;
+                }
             }
         }
 
-        // Update local statistics
-        {
-            let mut local = self.local_stats.write().await;
-            local.records_processed += count as u64;
-            local.bytes_processed += total_bytes as u64;
-        }
+        // Update worker statistics
+        self.worker_stats.records_processed.fetch_add(processed_count, Ordering::Relaxed);
+        self.worker_stats.bytes_processed.fetch_add(total_bytes as u64, Ordering::Relaxed);
+        self.worker_stats.processing_errors.fetch_add(failed_count, Ordering::Relaxed);
+        self.worker_stats.update_activity().await;
+        self.worker_stats.update_rps().await;
 
         // Update global statistics
-        {
-            let mut global = self.global_stats.write().await;
-            global.total_records_processed += count as u64;
-            global.total_bytes_processed += total_bytes as u64;
-            
-            if let Some(worker_stats) = global.worker_stats.get_mut(&self.worker_id) {
-                worker_stats.records_processed += count as u64;
-                worker_stats.bytes_processed += total_bytes as u64;
-            }
-        }
+        self.coordinator.total_records.fetch_add(processed_count, Ordering::Relaxed);
+        self.coordinator.total_bytes.fetch_add(total_bytes as u64, Ordering::Relaxed);
+        self.coordinator.total_errors.fetch_add(failed_count, Ordering::Relaxed);
 
-        // Checkpoint regularly
-        if let Some(last_record) = records.last() {
-            let checkpoint = last_record.extended_sequence_number();
-            match self.checkpointer.checkpoint(checkpoint).await {
-                Ok(_) => {
-                    info!("Worker {} checkpointed shard {}", self.worker_id, shard_id);
-                }
-                Err(e) => {
-                    warn!("Worker {} failed to checkpoint shard {}: {:?}", 
-                          self.worker_id, shard_id, e);
-                }
-            }
-        }
+        info!(
+            "Worker {} batch completed: {} processed, {} failed, {} bytes",
+            self.worker_id, processed_count, failed_count, total_bytes
+        );
     }
 
     async fn lease_lost(&self) {
-        let shard_id = &self.checkpointer.lease_key;
+        warn!("Worker {} lost lease", self.worker_id);
         
-        warn!("Worker {} lost lease for shard {}", self.worker_id, shard_id);
-        
-        // Update global statistics
-        {
-            let mut stats = self.global_stats.write().await;
-            stats.active_shards.remove(shard_id);
-            
-            if let Some(worker_stats) = stats.worker_stats.get_mut(&self.worker_id) {
-                worker_stats.active_shards.retain(|s| s != shard_id);
-            }
-        }
+        // Update worker status
+        let mut status = self.worker_stats.status.write().await;
+        *status = WorkerStatus::Failed;
     }
 
     async fn shard_ended(&self) {
-        let shard_id = &self.checkpointer.lease_key;
+        info!("Worker {} shard ended", self.worker_id);
         
-        info!("Worker {} finished shard {}", self.worker_id, shard_id);
-        
-        // Update global statistics
-        {
-            let mut stats = self.global_stats.write().await;
-            stats.active_shards.remove(shard_id);
-            
-            if let Some(worker_stats) = stats.worker_stats.get_mut(&self.worker_id) {
-                worker_stats.active_shards.retain(|s| s != shard_id);
-            }
-        }
-        
-        if let Err(e) = self.checkpointer.end().await {
-            warn!("Worker {} failed to end shard {}: {:?}", 
-                  self.worker_id, shard_id, e);
-        }
+        // Update worker status
+        let mut status = self.worker_stats.status.write().await;
+        *status = WorkerStatus::Stopping;
     }
 
     async fn shutdown_requested(&self) {
-        let (local_records, local_bytes) = {
-            let stats = self.local_stats.read().await;
-            (stats.records_processed, stats.bytes_processed)
-        };
+        info!("Worker {} shutdown requested", self.worker_id);
+        
+        // Update worker status
+        let mut status = self.worker_stats.status.write().await;
+        *status = WorkerStatus::Stopping;
+        
+        // Final statistics
+        let records = self.worker_stats.records_processed.load(Ordering::Relaxed);
+        let bytes = self.worker_stats.bytes_processed.load(Ordering::Relaxed);
+        let errors = self.worker_stats.processing_errors.load(Ordering::Relaxed);
         
         info!(
-            "Worker {} shutting down (processed {} records, {} bytes)",
-            self.worker_id, local_records, local_bytes
+            "Worker {} final stats: {} records, {} bytes, {} errors",
+            self.worker_id, records, bytes, errors
         );
     }
 }
 
 async fn create_worker(
     worker_id: String,
-    factory: Arc<MultiWorkerProcessorFactory>,
-    stream_name: String,
-    table_name: String,
-) -> Result<Comms, Box<dyn std::error::Error + Send + Sync>> {
-    info!("Starting worker: {}", worker_id);
+    coordinator: Arc<GlobalCoordinator>,
+    config: Args,
+) -> Result<KinesisClient, Box<dyn std::error::Error + Send + Sync>> {
+    info!("Creating worker: {}", worker_id);
 
-    // Initialize AWS clients for this worker
-    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-    let cloudwatch_client = Arc::new(aws_sdk_cloudwatch::Client::new(&config));
-    let dynamodb_client = Arc::new(aws_sdk_dynamodb::Client::new(&config));
-    let kinesis_client = Arc::new(aws_sdk_kinesis::Client::new(&config));
+    // Create AWS config
+    let aws_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
 
-    // Create management configuration - each worker will compete for leases
-    let management_config = ManagementConfig {
-        leases_to_acquire: 2, // Conservative - don't grab too many at once
-        max_leases: 10,       // Reasonable limit per worker
-        start_strategy: StartStrategy::Latest,
-    };
+    // Create the processor
+    let processor = Arc::new(MultiWorkerProcessor::new(worker_id.clone(), coordinator.clone()));
 
-    // Create lease configuration
-    let lease_config = LeaseConfig::PollingConfig { 
-        limit: 500 // Smaller batches for faster lease rotation
-    };
+    // Register worker with coordinator
+    coordinator.register_worker(processor.worker_stats.clone()).await;
+
+    // Update worker status
+    {
+        let mut status = processor.worker_stats.status.write().await;
+        *status = WorkerStatus::Running;
+    }
+
+    // Build Kinesis client configuration
+    let kinesis_config = KinesisClientConfig::builder()
+        .stream_name(config.stream_name)
+        .application_name(format!("{}-{}", config.app_name, worker_id))
+        .table_name(config.table_name)
+        .aws_config(aws_config)
+        .management_config(
+            ManagementConfig::builder()
+                .start_strategy(StartStrategy::Latest)
+                .leases_to_acquire(config.leases_to_acquire)
+                .max_leases(config.max_leases)
+                .build(),
+        )
+        .lease_config(LeaseConfig::PollingConfig { 
+            limit: config.batch_size 
+        })
+        .build();
 
     // Create the client
-    let client = Client::new(
-        factory,
-        cloudwatch_client,
-        dynamodb_client,
-        kinesis_client,
-        table_name,
-        stream_name,
-        management_config,
-        lease_config,
-    ).await;
+    let factory = KinesisClientFactory::new(kinesis_config);
+    let client = factory.create_client(processor).await?;
 
-    // Start the consumer
-    let comms = client.run().await?;
-    Ok(comms)
+    Ok(client)
+}
+
+async fn worker_supervisor(
+    worker_id: String,
+    coordinator: Arc<GlobalCoordinator>,
+    config: Args,
+    mut shutdown_rx: mpsc::Receiver<()>,
+) {
+    let restart_delay = Duration::from_secs(config.restart_delay_seconds);
+    let auto_restart = config.auto_restart;
+    
+    loop {
+        info!("Starting worker: {}", worker_id);
+        
+        let client = match create_worker(worker_id.clone(), coordinator.clone(), config.clone()).await {
+            Ok(client) => client,
+            Err(e) => {
+                error!("Failed to create worker {}: {:?}", worker_id, e);
+                if auto_restart {
+                    info!("Restarting worker {} in {:?}", worker_id, restart_delay);
+                    sleep(restart_delay).await;
+                    continue;
+                } else {
+                    break;
+                }
+            }
+        };
+
+        // Start the client
+        let client_clone = client.clone();
+        let worker_task = tokio::spawn(async move {
+            client_clone.start().await
+        });
+
+        // Wait for shutdown signal or worker completion
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                info!("Shutdown signal received for worker {}", worker_id);
+                client.shutdown().await;
+                break;
+            }
+            result = worker_task => {
+                match result {
+                    Ok(Ok(_)) => {
+                        info!("Worker {} completed successfully", worker_id);
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        error!("Worker {} failed: {:?}", worker_id, e);
+                        if auto_restart {
+                            info!("Restarting worker {} in {:?}", worker_id, restart_delay);
+                            sleep(restart_delay).await;
+                            continue;
+                        } else {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Worker {} task panicked: {:?}", worker_id, e);
+                        if auto_restart {
+                            info!("Restarting worker {} in {:?}", worker_id, restart_delay);
+                            sleep(restart_delay).await;
+                            continue;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Unregister worker
+    coordinator.unregister_worker(&worker_id).await;
+    info!("Worker supervisor {} stopped", worker_id);
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter("info,disney_kinesis_client=debug")
         .init();
 
     let args = Args::parse();
 
-    info!("Starting {} workers for stream: {}", args.workers, args.stream_name);
+    info!("Starting multi-worker consumer with configuration:");
+    info!("  Stream: {}", args.stream_name);
+    info!("  Table: {}", args.table_name);
+    info!("  Workers: {}", args.workers);
+    info!("  Batch Size: {}", args.batch_size);
+    info!("  Run Duration: {}s", args.run_duration_seconds);
+    info!("  Auto Restart: {}", args.auto_restart);
+    info!("  Dynamic Scaling: {}", args.dynamic_scaling);
 
-    // Create the master factory (first worker will own the global stats)
-    let master_worker_id = format!("worker-{}", Uuid::new_v4().to_string()[..8].to_string());
-    let master_factory = Arc::new(MultiWorkerProcessorFactory::new(master_worker_id.clone()));
+    // Create global coordinator
+    let coordinator = Arc::new(GlobalCoordinator::new(args.target_rps_per_worker));
 
-    // Start all workers
+    // Create shutdown channels
+    let (shutdown_tx, _) = mpsc::channel::<()>(args.workers);
+    let mut worker_shutdown_txs = Vec::new();
+
+    // Start worker supervisors
     let mut worker_handles = Vec::new();
-    let mut worker_comms = Vec::new();
-
     for i in 0..args.workers {
-        let worker_id = if i == 0 {
-            master_worker_id.clone()
-        } else {
-            format!("worker-{}", Uuid::new_v4().to_string()[..8].to_string())
-        };
-        
-        let factory = if i == 0 {
-            master_factory.clone()
-        } else {
-            Arc::new(master_factory.clone_with_shared_stats(worker_id.clone()))
-        };
+        let worker_id = format!("worker-{}", Uuid::new_v4().to_string()[..8]);
+        let (worker_shutdown_tx, worker_shutdown_rx) = mpsc::channel::<()>(1);
+        worker_shutdown_txs.push(worker_shutdown_tx);
 
-        let stream_name = args.stream_name.clone();
-        let table_name = args.table_name.clone();
+        let coordinator_clone = coordinator.clone();
+        let config_clone = args.clone();
         
         let handle = tokio::spawn(async move {
-            create_worker(worker_id, factory, stream_name, table_name).await
+            worker_supervisor(worker_id, coordinator_clone, config_clone, worker_shutdown_rx).await;
         });
         
         worker_handles.push(handle);
     }
 
-    // Wait for all workers to start
-    for handle in worker_handles {
-        match handle.await? {
-            Ok(comms) => worker_comms.push(comms),
-            Err(e) => error!("Failed to start worker: {:?}", e),
-        }
-    }
-
-    info!("All {} workers started successfully", worker_comms.len());
-
-    // Spawn a task to periodically print statistics
-    let stats_factory = master_factory.clone();
+    // Start statistics reporting
+    let stats_coordinator = coordinator.clone();
+    let stats_interval = Duration::from_secs(args.stats_interval_seconds);
     let stats_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        let mut interval = interval(stats_interval);
         loop {
             interval.tick().await;
-            stats_factory.print_global_stats().await;
+            stats_coordinator.print_statistics().await;
         }
     });
 
-    // Run for the specified duration or until Ctrl+C
+    // Dynamic scaling task
+    let scaling_task = if args.dynamic_scaling {
+        let scaling_coordinator = coordinator.clone();
+        Some(tokio::spawn(async move {
+            let mut interval = interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                
+                if scaling_coordinator.should_scale_up().await {
+                    info!("Scaling recommendation: SCALE UP");
+                    // In a real implementation, you would add more workers here
+                } else if scaling_coordinator.should_scale_down().await {
+                    info!("Scaling recommendation: SCALE DOWN");
+                    // In a real implementation, you would remove workers here
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Wait for completion or shutdown
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
 
-    tokio::select! {
-        _ = &mut ctrl_c => {
-            info!("Received shutdown signal");
+    if args.run_duration_seconds > 0 {
+        tokio::select! {
+            _ = &mut ctrl_c => {
+                info!("Received shutdown signal");
+            }
+            _ = sleep(Duration::from_secs(args.run_duration_seconds)) => {
+                info!("Reached maximum run duration");
+            }
         }
-        _ = sleep(Duration::from_secs(args.run_duration_seconds)) => {
-            info!("Reached maximum run duration");
-        }
+    } else {
+        ctrl_c.await.expect("Failed to listen for Ctrl+C");
+        info!("Received shutdown signal");
     }
 
-    // Stop the statistics task
+    // Stop background tasks
     stats_task.abort();
+    if let Some(scaling_task) = scaling_task {
+        scaling_task.abort();
+    }
+
+    // Shutdown all workers
+    info!("Shutting down all workers...");
+    for shutdown_tx in worker_shutdown_txs {
+        let _ = shutdown_tx.send(()).await;
+    }
+
+    // Wait for all workers to complete
+    for handle in worker_handles {
+        let _ = handle.await;
+    }
 
     // Print final statistics
-    master_factory.print_global_stats().await;
+    coordinator.print_statistics().await;
 
-    // Gracefully shutdown all workers
-    info!("Shutting down all workers...");
-    for (i, comms) in worker_comms.into_iter().enumerate() {
-        info!("Shutting down worker {}", i);
-        comms.shutdown().await;
-    }
-
-    info!("All workers stopped gracefully");
+    info!("Multi-worker consumer stopped");
     Ok(())
 }
