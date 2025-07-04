@@ -151,6 +151,37 @@ cargo run --example config_examples
 
 **Best for:** Understanding configuration options and deployment patterns
 
+### 6. **Resilient Consumer** (`resilient_consumer.rs`)
+A production-ready example demonstrating advanced error handling, retry logic, and recovery patterns.
+
+**Usage:**
+```bash
+# Basic resilient consumer
+cargo run --example resilient_consumer -- \
+  --stream-name my-test-stream \
+  --table-name my-app-leases
+
+# With custom retry and circuit breaker settings
+cargo run --example resilient_consumer -- \
+  --stream-name my-test-stream \
+  --table-name my-app-leases \
+  --max-retries 5 \
+  --retry-delay-ms 2000 \
+  --circuit-breaker-threshold 15 \
+  --processing-timeout-ms 10000
+```
+
+**Features:**
+- Exponential backoff retry logic with configurable attempts
+- Circuit breaker pattern to prevent cascading failures
+- Processing timeouts with graceful degradation
+- Dead letter queue for failed messages
+- Comprehensive error handling and recovery
+- Real-time statistics and monitoring
+- Periodic health reporting
+
+**Best for:** Production deployments requiring high reliability and fault tolerance
+
 ## Quick Start Guide
 
 ### Step 1: Create a Kinesis Stream
@@ -186,6 +217,11 @@ cargo run --example multi_worker -- \
   --stream-name test-stream \
   --table-name test-app-leases \
   --workers 2
+
+# Or resilient consumer with fault tolerance
+cargo run --example resilient_consumer -- \
+  --stream-name test-stream \
+  --table-name test-app-leases
 ```
 
 ## Prerequisites
