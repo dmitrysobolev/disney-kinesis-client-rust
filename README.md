@@ -8,7 +8,7 @@ Complete Rust crate documention is available, and examples of use are available 
 
 ## Distributed Algorithm
 
-This KCL uses distributed consensus, whereby the consumers are collaborative, there is no leader, and no node is (intentionally) malicious. The network is resilient against any subset of consumers failing. This is in contrast with the Java KCL which has an elected leader for some aspects of shard syncing.
+This KCL uses distributed consensus, whereby the consumers are collaborative and no node is (intentionally) malicious. The network is resilient against any subset of consumers failing. Calls to `ListShards` are only made by a random subset of nodes to limit API calls, in contrast with the Java KCL which has an elected leader that is a central point of failure.
 
 The goal is for a fleet (of unknown size) of consumers to consume from distinct kinesis shards, having an even distribution of work, and with minimal disruption to the service. Every record in the stream is processed using an "at least once delivery" guarantee from the point of it entering the kinesis stream until it has been successfully checkpointed by the user.
 
@@ -270,14 +270,8 @@ That has now become available and we aim to add EFO support shortly.
 
 The following endpoints are necessary to be able to implement EFO
 
-- [`RegitserStreamConsumer`]( https://docs.aws.amazon.com/kinesis/latest/APIReference/API_RegisterStreamConsumer.html)
+- [`RegisterStreamConsumer`]( https://docs.aws.amazon.com/kinesis/latest/APIReference/API_RegisterStreamConsumer.html)
 - [`SubscribeToShard`](https://docs.aws.amazon.com/kinesis/latest/APIReference/API_SubscribeToShard.html)
-
-## Potential ListShards Usage Limits
-
-The `ListShards` endpoint has a limit of 1000 requests per second, per stream, and the call is paged (maximum of 1,000 shards per response). Given that every consumer would poll this every 20 seconds, it is possible that for extremely large streams, with large numbers of recent resharding events, may exceed the account limits. This is largely irrelevant when EFO is not available as it places a natural limit on the number of consumers.
-
-This could be mitigated by having the lease manager randomise, back off or, following the lead of the AWS Java implementation, using elected leaders to perform shard syncing. We believe that randomness is more reliable in the typical case, since anything involving a leader election can have chronic failure modes.
 
 ## Hot Shard Mitigation
 
